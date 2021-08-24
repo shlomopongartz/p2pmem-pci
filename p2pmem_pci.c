@@ -22,8 +22,6 @@
 #include <linux/pfn_t.h>
 
 #define PCI_VENDOR_EIDETICOM 0x1de5
-#define PCI_VENDOR_MICROSEMI 0x11f8
-#define PCI_MTRAMON_DEV_ID   0xf117
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Stephen Bates <stephen@eideticom.com");
@@ -41,8 +39,6 @@ static dev_t p2pmem_devt;
 
 static struct pci_device_id p2pmem_pci_id_table[] = {
 	{ PCI_DEVICE(PCI_VENDOR_EIDETICOM, 0x1000), .driver_data = 0 },
-	{ PCI_DEVICE(PCI_VENDOR_MICROSEMI,
-		     PCI_MTRAMON_DEV_ID), .driver_data = MTRAMON_BAR },
 	{ 0, }
 };
 MODULE_DEVICE_TABLE(pci, p2pmem_pci_id_table);
@@ -52,101 +48,12 @@ struct p2pmem_dev {
 	struct pci_dev *pdev;
 	int id;
 	struct cdev cdev;
-	bool created_by_hack;
 };
 
 static struct p2pmem_dev *to_p2pmem(struct device *dev)
 {
 	return container_of(dev, struct p2pmem_dev, dev);
 }
-
-struct p2pmem_vma {
-	struct p2pmem_dev *p2pmem_dev;
-	atomic_t mmap_count;
-	size_t nr_pages;
-
-	/* Protects the used_pages array */
-	struct mutex mutex;
-	struct page *used_pages[];
-};
-
-static void p2pmem_vma_open(struct vm_area_struct *vma)
-{
-	struct p2pmem_vma *pv = vma->vm_private_data;
-
-	atomic_inc(&pv->mmap_count);
-}
-
-static void p2pmem_vma_free_pages(struct vm_area_struct *vma)
-{
-	int i;
-	struct p2pmem_vma *pv = vma->vm_private_data;
-
-	mutex_lock(&pv->mutex);
-
-	for (i = 0; i < pv->nr_pages; i++) {
-		if (pv->used_pages[i]) {
-			pci_free_p2pmem(pv->p2pmem_dev->pdev,
-					page_to_virt(pv->used_pages[i]),
-					PAGE_SIZE);
-			pv->used_pages[i] = NULL;
-		}
-	}
-
-	mutex_unlock(&pv->mutex);
-}
-
-static void p2pmem_vma_close(struct vm_area_struct *vma)
-{
-	struct p2pmem_vma *pv = vma->vm_private_data;
-
-	if (!atomic_dec_and_test(&pv->mmap_count))
-		return;
-
-	p2pmem_vma_free_pages(vma);
-
-	dev_dbg(&pv->p2pmem_dev->dev, "vma close");
-	kfree(pv);
-}
-
-static vm_fault_t p2pmem_vma_fault(struct vm_fault *vmf)
-{
-	struct p2pmem_vma *pv = vmf->vma->vm_private_data;
-	unsigned int pg_idx;
-	struct page *pg;
-	pfn_t pfn;
-	vm_fault_t rc;
-
-	pg_idx = (vmf->address - vmf->vma->vm_start) / PAGE_SIZE;
-
-	mutex_lock(&pv->mutex);
-
-	if (pv->used_pages[pg_idx])
-		pg = pv->used_pages[pg_idx];
-	else
-		pg = virt_to_page(pci_alloc_p2pmem(pv->p2pmem_dev->pdev,
-						   PAGE_SIZE));
-
-	if (!pg) {
-		mutex_unlock(&pv->mutex);
-		return VM_FAULT_OOM;
-	}
-
-	pv->used_pages[pg_idx] = pg;
-
-	pfn = phys_to_pfn_t(page_to_phys(pg), PFN_DEV | PFN_MAP);
-	rc = vmf_insert_mixed(vmf->vma, vmf->address, pfn);
-
-	mutex_unlock(&pv->mutex);
-
-	return rc;
-}
-
-const struct vm_operations_struct p2pmem_vmops = {
-	.open = p2pmem_vma_open,
-	.close = p2pmem_vma_close,
-	.fault = p2pmem_vma_fault,
-};
 
 static int p2pmem_open(struct inode *inode, struct file *filp)
 {
@@ -161,31 +68,8 @@ static int p2pmem_open(struct inode *inode, struct file *filp)
 static int p2pmem_mmap(struct file *filp, struct vm_area_struct *vma)
 {
 	struct p2pmem_dev *p = filp->private_data;
-	struct p2pmem_vma *pv;
-	size_t nr_pages = (vma->vm_end - vma->vm_start) / PAGE_SIZE;
 
-	if ((vma->vm_flags & VM_MAYSHARE) != VM_MAYSHARE) {
-		dev_warn(&p->dev, "mmap failed: can't create private mapping\n");
-		return -EINVAL;
-	}
-
-	dev_dbg(&p->dev, "Allocating mmap with %zd pages.\n", nr_pages);
-
-	pv = kzalloc(sizeof(*pv) + sizeof(pv->used_pages[0]) * nr_pages,
-		     GFP_KERNEL);
-	if (!pv)
-		return -ENOMEM;
-
-	mutex_init(&pv->mutex);
-	pv->nr_pages = nr_pages;
-	pv->p2pmem_dev = p;
-	atomic_set(&pv->mmap_count, 1);
-
-	vma->vm_private_data = pv;
-	vma->vm_ops = &p2pmem_vmops;
-	vma->vm_flags |= VM_MIXEDMAP;
-
-	return 0;
+	return pci_mmap_p2pmem(p->pdev, vma);
 }
 
 static const struct file_operations p2pmem_fops = {
@@ -257,6 +141,7 @@ static int p2pmem_test_p2p_access(struct p2pmem_dev *p)
 {
 	u32 *addr;
 	const u32 test_value = 0x11223344;
+	u32 output;
 	int err = 0;
 
 	addr = pci_alloc_p2pmem(p->pdev, PAGE_SIZE);
@@ -264,12 +149,16 @@ static int p2pmem_test_p2p_access(struct p2pmem_dev *p)
 		return -ENOMEM;
 
 	WRITE_ONCE(addr[0], 0);
+	output = READ_ONCE(addr[0]);
+	dev_info(&p->dev, "READ_ONCE says %x", output);
 	if (READ_ONCE(addr[0]) != 0) {
 		err = -EFAULT;
 		goto out;
 	}
 
 	WRITE_ONCE(addr[0], test_value);
+	output = READ_ONCE(addr[0]);
+	dev_info(&p->dev, "READ_ONCE says %x", output);
 	if (READ_ONCE(addr[0]) != test_value) {
 		err = -EFAULT;
 		goto out;
@@ -367,7 +256,7 @@ static int p2pmem_pci_probe(struct pci_dev *pdev,
 		goto out;
 	}
 
-	err = pci_p2pdma_add_resource(pdev, id->driver_data, 0, 0);
+	err = pci_p2pdma_add_resource(pdev, 0, 0, 0);
 	if (err) {
 		dev_err(&pdev->dev, "unable to add p2p resource");
 		goto out_disable_device;
@@ -403,73 +292,6 @@ static struct pci_driver p2pmem_pci_driver = {
 	.remove = p2pmem_pci_remove,
 };
 
-static void ugly_mtramon_hack_init(void)
-{
-	struct pci_dev *pdev = NULL;
-	struct p2pmem_dev *p;
-	int err;
-
-	while ((pdev = pci_get_device(PCI_VENDOR_MICROSEMI,
-				      PCI_MTRAMON_DEV_ID,
-				      pdev))) {
-		// If there's no driver it can be handled by the regular
-		//  pci driver case
-		if (!pdev->driver)
-			continue;
-
-		// The NVME driver already handled it
-		if (pdev->p2pdma)
-			continue;
-
-		if (!pdev->p2pdma) {
-			err = pci_p2pdma_add_resource(pdev, MTRAMON_BAR, 0, 0);
-			if (err) {
-				dev_err(&pdev->dev,
-					"unable to add p2p resource");
-				continue;
-			}
-		}
-
-		p = p2pmem_create(pdev);
-		if (!p)
-			continue;
-
-		p->created_by_hack = true;
-	}
-}
-
-static void ugly_hack_to_create_p2pmem_devs_for_other_devices(void)
-{
-	struct pci_dev *pdev = NULL;
-	struct p2pmem_dev *p;
-
-	while ((pdev = pci_get_device(PCI_ANY_ID, PCI_ANY_ID, pdev))) {
-		if (!pdev->p2pdma)
-			continue;
-
-		p = p2pmem_create(pdev);
-		if (!p)
-			continue;
-
-		p->created_by_hack = true;
-	}
-}
-
-static void ugly_hack_deinit(void)
-{
-	struct class_dev_iter iter;
-	struct device *dev;
-	struct p2pmem_dev *p;
-
-	class_dev_iter_init(&iter, p2pmem_class, NULL, NULL);
-	while ((dev = class_dev_iter_next(&iter))) {
-		p = to_p2pmem(dev);
-		if (p->created_by_hack)
-			p2pmem_destroy(p);
-	}
-	class_dev_iter_exit(&iter);
-}
-
 static int __init p2pmem_pci_init(void)
 {
 	int rc;
@@ -481,9 +303,6 @@ static int __init p2pmem_pci_init(void)
 	rc = alloc_chrdev_region(&p2pmem_devt, 0, max_devices, "p2pmem");
 	if (rc)
 		goto err_class;
-
-	ugly_hack_to_create_p2pmem_devs_for_other_devices();
-	ugly_mtramon_hack_init();
 
 	rc = pci_register_driver(&p2pmem_pci_driver);
 	if (rc)
@@ -502,7 +321,6 @@ err_class:
 static void __exit p2pmem_pci_cleanup(void)
 {
 	pci_unregister_driver(&p2pmem_pci_driver);
-	ugly_hack_deinit();
 	unregister_chrdev_region(p2pmem_devt, max_devices);
 	class_destroy(p2pmem_class);
 	pr_info(KBUILD_MODNAME ": module unloaded\n");
