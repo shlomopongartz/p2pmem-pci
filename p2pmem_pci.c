@@ -24,6 +24,9 @@
 #define PCI_VENDOR_EIDETICOM 0x1de5
 #define PCI_VENDOR_MICROSEMI 0x11f8
 #define PCI_MTRAMON_DEV_ID   0xf117
+#define PCI_VENDOR_XILINX    0x10ee
+#define PCI_VENDOR_PLIOPS    0x1e7e  
+#define PCI_CAFE_DEV_ID      0xcafe
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Stephen Bates <stephen@eideticom.com");
@@ -35,6 +38,10 @@ MODULE_PARM_DESC(max_devices, "Maximum number of char devices");
 
 #define MTRAMON_BAR 4
 
+#define PLIOPS_BAR 4
+#define PLIOPS_OFFSET 0
+#define PLIOPS_SIZE 0x2000000
+
 static struct class *p2pmem_class;
 static DEFINE_IDA(p2pmem_ida);
 static dev_t p2pmem_devt;
@@ -43,6 +50,7 @@ static struct pci_device_id p2pmem_pci_id_table[] = {
 	{ PCI_DEVICE(PCI_VENDOR_EIDETICOM, 0x1000), .driver_data = 0 },
 	{ PCI_DEVICE(PCI_VENDOR_MICROSEMI,
 		     PCI_MTRAMON_DEV_ID), .driver_data = MTRAMON_BAR },
+        { PCI_DEVICE(PCI_VENDOR_PLIOPS, PCI_CAFE_DEV_ID), .driver_data = PLIOPS_BAR },
 	{ 0, }
 };
 MODULE_DEVICE_TABLE(pci, p2pmem_pci_id_table);
@@ -374,7 +382,6 @@ static int p2pmem_pci_probe(struct pci_dev *pdev,
 	}
 
 	pci_p2pmem_publish(pdev, true);
-
 	p = p2pmem_create(pdev);
 	if (IS_ERR(p))
 		goto out_disable_device;
@@ -438,6 +445,52 @@ static void ugly_mtramon_hack_init(void)
 	}
 }
 
+static void ugly_pliops_hack_init(void)
+{
+	struct pci_dev *pdev = NULL;
+	struct p2pmem_dev *p;
+	int err;
+	u16 command;
+
+	while ((pdev = pci_get_device(PCI_VENDOR_PLIOPS,
+				      PCI_CAFE_DEV_ID,
+				      pdev))) {
+		// If there's no driver it can be handled by the regular
+		//  pci driver case
+		if (!pdev->driver)
+			continue;
+
+		// Quirk
+		if (pci_read_config_word(pdev, PCI_COMMAND, &command) == 0) {
+			if ((command & PCI_COMMAND_MEMORY) == 0) {
+				command |=  PCI_COMMAND_MEMORY;
+				if (pci_write_config_word(pdev, PCI_COMMAND, command))
+					dev_err(&pdev->dev, "Can't write config word");
+			}
+		} else {
+			dev_err(&pdev->dev, "Can't read config word");
+		}	
+		// The NVME driver already handled it
+		if (pdev->p2pdma)
+			continue;
+
+		if (!pdev->p2pdma) {
+			err = pci_p2pdma_add_resource(pdev, PLIOPS_BAR, PLIOPS_SIZE, PLIOPS_OFFSET);
+			if (err) {
+				dev_err(&pdev->dev,
+					"unable to add p2p resource");
+				continue;
+			}
+		}
+
+		p = p2pmem_create(pdev);
+		if (!p)
+			continue;
+
+		p->created_by_hack = true;
+	}
+}
+
 static void ugly_hack_to_create_p2pmem_devs_for_other_devices(void)
 {
 	struct pci_dev *pdev = NULL;
@@ -484,6 +537,7 @@ static int __init p2pmem_pci_init(void)
 
 	ugly_hack_to_create_p2pmem_devs_for_other_devices();
 	ugly_mtramon_hack_init();
+	ugly_pliops_hack_init();
 
 	rc = pci_register_driver(&p2pmem_pci_driver);
 	if (rc)
