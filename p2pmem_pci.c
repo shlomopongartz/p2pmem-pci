@@ -561,18 +561,22 @@ static void hack_hack(void)
 {
 	struct pci_dev *pdev = NULL;
 	struct pci_dev *sdev = NULL;
-	struct device *clients[1];
 
 	pdev = pci_get_device(PCI_VENDOR_PLIOPS,
 			      PCI_PLIOPS_DEV_ID,
 			      pdev);
 
-	sdev = pci_get_device(0x144d,
-			      0xa808,
-			      sdev);
-	clients[0] = &sdev->dev;
-	if (pci_p2pdma_distance_many(pdev, clients, 1, true) < 0)
-		pr_err(">>> DISTANCE\n");
+	for_each_pci_dev(sdev) {
+		struct device *clients[1];
+		if (sdev->class != PCI_CLASS_STORAGE_EXPRESS)
+			continue;
+		pci_err(sdev, ">>> FOUND\n");
+		clients[0] = &sdev->dev;
+		if (pci_p2pdma_distance_many(pdev, clients, 1, true) < 0)
+			pci_err(sdev, ">>> DISTANCE BAD\n");
+		else
+			pci_err(sdev, ">>> DISTANCE GOOD\n");
+	}
 }
 
 static int __init p2pmem_pci_init(void)
